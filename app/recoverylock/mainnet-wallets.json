@@ -1,0 +1,9 @@
+{
+  "chain_id": "lava-mainnet-1",
+  "recovery_address": "RECOVERY_ADDRESS",
+  "fee_payer_address": "FEE_PAYER_ADDRESS",
+  "wallets": [
+    "lava@1zhxz4ju3az3ajg8ralyuu4huh906qfx42ay0w3",
+    "AFFECTED_WALLET_ADDRESS"
+  ]
+}

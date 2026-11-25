@@ -1,0 +1,4 @@
+# TEST VALUES for unit tests and local chains (private keys are sha256 of "recoverylock-test-listed-<i>"). Never use them on a real chain.
+lava@1p8v4sd70qvvg737wthgeuafc7hh20uf555jn33
+lava@1udx7a8ujgc6h95qt9cpxdrcu4t5nkz8sxeh4d0
+lava@19pl7sv85wc6hhrn9rtgu3p96yczdwft5wjxyr9
