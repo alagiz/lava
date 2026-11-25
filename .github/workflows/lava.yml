@@ -56,11 +56,14 @@ jobs:
       - name: Run X Tests
         run: |
           set -o pipefail
-          go test -json -coverprofile=x-coverage.out ./x/... \
+          go test -json -coverprofile=x-coverage.out ./x/... ./app/... \
             | tee x-test.json \
             | grep -v '"Action":"output"' \
             | go-junit-report -parser gojson -set-exit-code -out x-report.xml
           jq -r 'select(.Action=="output") | .Output' x-test.json > x-test.log || true
+
+      - name: Run Recovery Lock Tests
+        run: go test -tags recoverylock_test ./app ./app/recoverylock
 
       - name: Print failed test output
         if: failure()

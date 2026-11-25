@@ -23,6 +23,7 @@ import (
 	timerstorekeeper "github.com/lavanet/lava/v5/x/timerstore/keeper"
 	timerstoretypes "github.com/lavanet/lava/v5/x/timerstore/types"
 
+	"github.com/cosmos/gogoproto/grpc"
 	"github.com/cosmos/ibc-apps/middleware/packet-forward-middleware/v7/packetforward"
 	packetforwardkeeper "github.com/cosmos/ibc-apps/middleware/packet-forward-middleware/v7/packetforward/keeper"
 	packetforwardtypes "github.com/cosmos/ibc-apps/middleware/packet-forward-middleware/v7/packetforward/types"
@@ -114,6 +115,7 @@ import (
 	ibctm "github.com/cosmos/ibc-go/v7/modules/light-clients/07-tendermint"
 	"github.com/lavanet/lava/v5/app/keepers"
 	appparams "github.com/lavanet/lava/v5/app/params"
+	"github.com/lavanet/lava/v5/app/recoverylock"
 	"github.com/lavanet/lava/v5/app/upgrades"
 	"github.com/lavanet/lava/v5/docs"
 	conflictmodule "github.com/lavanet/lava/v5/x/conflict"
@@ -310,6 +312,10 @@ type LavaApp struct {
 
 	// module configurator.
 	configurator module.Configurator
+
+	// RecoveryLock is nil unless the embedded recovery lock configuration is
+	// enabled (app/recoverylock).
+	RecoveryLock *recoverylock.Lock
 }
 
 // New returns a reference to an initialized blockchain app
@@ -400,6 +406,25 @@ func New(
 		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.ModuleAccountAddrs(),
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
+
+	// Recovery lock: with the committed (disabled) configuration RecoveryLock
+	// is nil and nothing below is wrapped, so the app is unchanged. When it
+	// is enabled, the bank keeper is wrapped here, before any keeper or
+	// module receives it, and the keepers that dispatch messages for other
+	// accounts get a guarded router.
+	lockAddressCodec := recoverylock.AddressCodec{Prefix: sdk.GetConfig().GetBech32AccountAddrPrefix()}
+	lockConfig := recoverylock.MustConfig(lockAddressCodec, app.ModuleAccountAddrs(), logger)
+	app.RecoveryLock = recoverylock.New(lockConfig, lockAddressCodec, &app.DistrKeeper, app.LastBlockHeight)
+	dispatchRouter := app.MsgServiceRouter()
+	// The SDK bank module type-asserts its keeper to BaseKeeper (for its
+	// store migrations), so it keeps the base keeper. Its MsgSend and
+	// MsgMultiSend are signed by the debited account and are covered by the
+	// ante decorator and the dispatch router.
+	bankModuleKeeper := app.BankKeeper
+	if app.RecoveryLock != nil {
+		app.BankKeeper = recoverylock.Bank{Keeper: app.BankKeeper, L: app.RecoveryLock}
+		dispatchRouter = recoverylock.NewDispatchRouter(interfaceRegistry)
+	}
 	app.StakingKeeper = stakingkeeper.NewKeeper(
 		appCodec, keys[stakingtypes.StoreKey], app.AccountKeeper, app.BankKeeper,
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
@@ -420,8 +445,8 @@ func New(
 	)
 
 	app.FeeGrantKeeper = feegrantkeeper.NewKeeper(appCodec, keys[feegrant.StoreKey], app.AccountKeeper)
-	app.GroupKeeper = groupkeeper.NewKeeper(keys[group.StoreKey], appCodec, app.MsgServiceRouter(), app.AccountKeeper, group.DefaultConfig())
-	app.AuthzKeeper = authzkeeper.NewKeeper(keys[authzkeeper.StoreKey], appCodec, app.MsgServiceRouter(), app.AccountKeeper)
+	app.GroupKeeper = groupkeeper.NewKeeper(keys[group.StoreKey], appCodec, dispatchRouter, app.AccountKeeper, group.DefaultConfig())
+	app.AuthzKeeper = authzkeeper.NewKeeper(keys[authzkeeper.StoreKey], appCodec, dispatchRouter, app.AccountKeeper)
 	app.UpgradeKeeper = *upgradekeeper.NewKeeper(
 		skipUpgradeHeights,
 		keys[upgradetypes.StoreKey],
@@ -626,7 +651,7 @@ func New(
 		&app.IBCKeeper.PortKeeper,
 		app.AccountKeeper,
 		scopedICAHostKeeper,
-		app.MsgServiceRouter(),
+		dispatchRouter,
 	)
 	icaControllerKeeper := icacontrollerkeeper.NewKeeper(
 		appCodec, keys[icacontrollertypes.StoreKey],
@@ -710,8 +735,13 @@ func New(
 	// must be passed by reference here.
 
 	// register the staking hooks
+	stakingHooks := []stakingtypes.StakingHooks{app.DistrKeeper.Hooks(), app.SlashingKeeper.Hooks(), app.DualstakingKeeper.Hooks()}
+	if app.RecoveryLock != nil {
+		// must run before the distribution hooks
+		stakingHooks = append([]stakingtypes.StakingHooks{recoverylock.StakingHooks{L: app.RecoveryLock}}, stakingHooks...)
+	}
 	app.StakingKeeper.SetHooks(
-		stakingtypes.NewMultiStakingHooks(app.DistrKeeper.Hooks(), app.SlashingKeeper.Hooks(), app.DualstakingKeeper.Hooks()),
+		stakingtypes.NewMultiStakingHooks(stakingHooks...),
 	)
 
 	app.mm = module.NewManager(
@@ -721,7 +751,7 @@ func New(
 		),
 		auth.NewAppModule(appCodec, app.AccountKeeper, nil, app.GetSubspace(authtypes.ModuleName)),
 		vesting.NewAppModule(app.AccountKeeper, app.BankKeeper),
-		bank.NewAppModule(appCodec, app.BankKeeper, app.AccountKeeper, app.GetSubspace(banktypes.ModuleName)),
+		bank.NewAppModule(appCodec, bankModuleKeeper, app.AccountKeeper, app.GetSubspace(banktypes.ModuleName)),
 		capability.NewAppModule(appCodec, *app.CapabilityKeeper, false),
 		feegrantmodule.NewAppModule(appCodec, app.AccountKeeper, app.BankKeeper, app.FeeGrantKeeper, app.interfaceRegistry),
 		gov.NewAppModule(appCodec, &app.GovKeeper, app.AccountKeeper, app.BankKeeper, app.GetSubspace(govtypes.ModuleName)),
@@ -872,7 +902,13 @@ func New(
 	)
 
 	app.mm.RegisterInvariants(&app.CrisisKeeper)
-	app.configurator = module.NewConfigurator(app.appCodec, app.MsgServiceRouter(), app.GRPCQueryRouter())
+	var msgServer grpc.Server = app.MsgServiceRouter()
+	if app.RecoveryLock != nil {
+		// registers every message service in the app's router and, guarded,
+		// in the dispatch router
+		msgServer = recoverylock.Tee{Primary: app.MsgServiceRouter(), Dispatch: dispatchRouter, L: app.RecoveryLock}
+	}
+	app.configurator = module.NewConfigurator(app.appCodec, msgServer, app.GRPCQueryRouter())
 	app.mm.RegisterServices(app.configurator)
 
 	// setupUpgradeHandlers. must be called before LoadLatestVersion as storeloader is sealed after that
@@ -898,7 +934,8 @@ func New(
 			encodingConfig.TxConfig.SignModeHandler(),
 			app.FeeGrantKeeper,
 			app.SpecKeeper,
-			ante.DefaultSigVerificationGasConsumer),
+			ante.DefaultSigVerificationGasConsumer,
+			app.RecoveryLock),
 	)
 	app.SetEndBlocker(app.EndBlocker)
 
@@ -953,6 +990,11 @@ func (app *LavaApp) Name() string { return app.BaseApp.Name() }
 
 // BeginBlocker application updates every begin block
 func (app *LavaApp) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
+	if app.RecoveryLock != nil {
+		// logs the listed accounts' vesting end times at the activation
+		// height; reads state only
+		app.RecoveryLock.Report(ctx, app.AccountKeeper, app.Logger())
+	}
 	return app.mm.BeginBlock(ctx, req)
 }
 

@@ -5,19 +5,26 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/auth/ante"
 	"github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	"github.com/lavanet/lava/v5/app/recoverylock"
 	dualstakingante "github.com/lavanet/lava/v5/x/dualstaking/ante"
 	dualstakingkeeper "github.com/lavanet/lava/v5/x/dualstaking/keeper"
 	specante "github.com/lavanet/lava/v5/x/spec/ante"
 	"github.com/lavanet/lava/v5/x/spec/keeper"
 )
 
-func NewAnteHandler(accountKeeper ante.AccountKeeper, bankKeeper authtypes.BankKeeper, dualstakingKeeper dualstakingkeeper.Keeper, signModeHandler signing.SignModeHandler, feegrantKeeper ante.FeegrantKeeper, specKeeper keeper.Keeper, sigGasConsumer ante.SignatureVerificationGasConsumer) sdk.AnteHandler {
+func NewAnteHandler(accountKeeper ante.AccountKeeper, bankKeeper authtypes.BankKeeper, dualstakingKeeper dualstakingkeeper.Keeper, signModeHandler signing.SignModeHandler, feegrantKeeper ante.FeegrantKeeper, specKeeper keeper.Keeper, sigGasConsumer ante.SignatureVerificationGasConsumer, recoveryLock *recoverylock.Lock) sdk.AnteHandler {
 	anteDecorators := []sdk.AnteDecorator{
 		ante.NewSetUpContextDecorator(), // outermost AnteDecorator. SetUpContext must be called first
 		ante.NewExtensionOptionsDecorator(nil),
 		ante.NewValidateBasicDecorator(),
 		ante.NewTxTimeoutHeightDecorator(),
 		ante.NewValidateMemoDecorator(accountKeeper),
+	}
+	if recoveryLock != nil {
+		// before fee deduction and signature checks; nil when the lock is disabled
+		anteDecorators = append(anteDecorators, recoverylock.Decorator{L: recoveryLock})
+	}
+	anteDecorators = append(anteDecorators,
 		ante.NewConsumeGasForTxSizeDecorator(accountKeeper),
 		ante.NewDeductFeeDecorator(accountKeeper, bankKeeper, feegrantKeeper, nil),
 		ante.NewSetPubKeyDecorator(accountKeeper), // SetPubKeyDecorator must be called before all signature verification decorators
@@ -27,6 +34,6 @@ func NewAnteHandler(accountKeeper ante.AccountKeeper, bankKeeper authtypes.BankK
 		ante.NewIncrementSequenceDecorator(accountKeeper),
 		dualstakingante.NewRedelegationFlager(dualstakingKeeper),
 		specante.NewExpeditedProposalFilterAnteDecorator(specKeeper),
-	}
+	)
 	return sdk.ChainAnteDecorators(anteDecorators...)
 }
